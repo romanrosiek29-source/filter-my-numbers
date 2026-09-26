@@ -8,9 +8,9 @@ from phonenumbers import carrier, geocoder
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
-PAGE = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Filter my Numbers</title><style>body{font-family:system-ui,sans-serif;background:#f5f7fb;color:#172033;margin:0}main{max-width:780px;margin:48px auto;padding:24px}form,.card{background:white;padding:24px;border-radius:12px;box-shadow:0 2px 12px #17203312;margin:18px 0}label{display:block;margin:14px 0 6px}input{max-width:100%}button{background:#3156db;color:white;border:0;border-radius:8px;padding:12px 18px;cursor:pointer}.error{color:#a21c32}.note{color:#596579}table{width:100%;border-collapse:collapse;background:white}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left} .scroll{overflow-x:auto}</style></head><body><main><h1>Filter my Numbers</h1><p class="note">Check number format and metadata. This does not confirm whether a number is active, reachable, or registered on any app.</p><form method="post" action="/check" enctype="multipart/form-data"><label for="file">CSV or TXT file (one number per line; CSV: first column)</label><input id="file" name="file" type="file" accept=".csv,.txt" required><label for="region">Default two-letter country code for local numbers (for example PK)</label><input id="region" name="region" maxlength="2" pattern="[A-Za-z]{2}" placeholder="PK"><p class="note">Up to 5,000 numbers and 2 MB per file. Your file is processed in memory and is not saved by this app.</p><button>Check numbers</button></form>{% if error %}<p class="error" role="alert">{{error}}</p>{% endif %}{% if results is not none %}<div class="card"><h2>Results</h2><p>{{results|length}} checked; {{results|selectattr('valid')|list|length}} valid by numbering plan.</p><form method="post" action="/download"><input type="hidden" name="token" value="{{token}}"><button>Download CSV</button></form></div><div class="scroll"><table><thead><tr><th>Input</th><th>Valid</th><th>E.164</th><th>Region</th><th>Carrier (original allocation)</th><th>Type</th><th>Note</th></tr></thead><tbody>{% for r in results[:100] %}<tr><td>{{r.input}}</td><td>{{'Yes' if r.valid else 'No'}}</td><td>{{r.e164}}</td><td>{{r.region}}</td><td>{{r.carrier}}</td><td>{{r.type}}</td><td>{{r.note}}</td></tr>{% endfor %}</tbody></table></div><p class="note">Showing first 100 rows; download the CSV for all results.</p>{% endif %}</main></body></html>'''
+PAGE = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Filter my Numbers</title><style>body{font-family:system-ui,sans-serif;background:#f5f7fb;color:#172033;margin:0}main{max-width:900px;margin:48px auto;padding:24px}form,.card{background:white;padding:24px;border-radius:12px;box-shadow:0 2px 12px #17203312;margin:18px 0}label{display:block;margin:14px 0 6px}input{max-width:100%}button,.button{display:inline-block;background:#3156db;color:white;border:0;border-radius:8px;padding:12px 18px;cursor:pointer;text-decoration:none}.error{color:#a21c32}.note{color:#596579}table{width:100%;border-collapse:collapse;background:white}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}.scroll{overflow-x:auto}</style></head><body><main><h1>Filter my Numbers</h1><p class="note">Numbering-plan validation only. This does not confirm a number is active, reachable, or registered on an app.</p><form method="post" action="/check" enctype="multipart/form-data"><label for="file">CSV or TXT file (one number per line; CSV: first column)</label><input id="file" name="file" type="file" accept=".csv,.txt" required><label for="region">Two-letter region for local numbers (for example PK)</label><input id="region" name="region" maxlength="2" pattern="[A-Za-z]{2}" placeholder="PK"><p class="note">Maximum 5,000 numbers and 2 MB. Files are processed in memory, not stored.</p><button>Check numbers</button></form>{% if error %}<p class="error" role="alert">{{error}}</p>{% endif %}{% if results is not none %}<div class="card"><h2>Results</h2><p>{{results|length}} checked; {{results|selectattr('valid')|list|length}} valid by numbering plan.</p><a class="button" id="download" href="#">Download CSV</a></div><div class="scroll"><table><thead><tr><th>Input</th><th>Valid</th><th>E.164</th><th>Region</th><th>Carrier (original allocation)</th><th>Type</th><th>Note</th></tr></thead><tbody>{% for r in results[:100] %}<tr><td>{{r.input}}</td><td>{{'Yes' if r.valid else 'No'}}</td><td>{{r.e164}}</td><td>{{r.region}}</td><td>{{r.carrier}}</td><td>{{r.type}}</td><td>{{r.note}}</td></tr>{% endfor %}</tbody></table></div><p class="note">Showing first 100 rows; download for all results. Preview is not saved after you leave this page.</p><script>const rows={{ csvrows|tojson }};const escape=v=>'"'+String(v).replaceAll('"','""')+'"';const csv=rows.map(row=>row.map(escape).join(',')).join('\r\n');const blob=new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const link=document.getElementById('download');link.href=url;link.download='filter-my-numbers.csv';window.addEventListener('pagehide',()=>URL.revokeObjectURL(url));</script>{% endif %}</main></body></html>'''
 
-CACHE = {}
+HEADERS = ('input', 'valid', 'e164', 'region', 'carrier', 'type', 'note')
 
 def safe_cell(value):
     text = str(value)
@@ -41,32 +41,29 @@ def index():
 def check():
     uploaded = request.files.get('file')
     region = request.form.get('region', '').strip().upper() or None
-    if region and (len(region) != 2 or not region.isalpha()):
-        return render_template_string(PAGE, results=None, error='Use a two-letter country code.'), 400
+    if region and (len(region) != 2 or not region.isascii() or not region.isalpha()):
+        return render_template_string(PAGE, results=None, error='Use a two-letter ISO country code.'), 400
     if not uploaded or not uploaded.filename.lower().endswith(('.csv', '.txt')):
         return render_template_string(PAGE, results=None, error='Choose a CSV or TXT file.'), 400
     try:
         text = uploaded.read().decode('utf-8-sig')
-    except UnicodeDecodeError:
-        return render_template_string(PAGE, results=None, error='Use UTF-8 text.'), 400
-    if uploaded.filename.lower().endswith('.csv'):
-        values = [row[0].strip() for row in csv.reader(io.StringIO(text)) if row and row[0].strip()]
-    else:
-        values = [line.strip() for line in text.splitlines() if line.strip()]
+        if uploaded.filename.lower().endswith('.csv'):
+            values = [row[0].strip() for row in csv.reader(io.StringIO(text)) if row and row[0].strip()]
+        else:
+            values = [line.strip() for line in text.splitlines() if line.strip()]
+    except (UnicodeDecodeError, csv.Error):
+        return render_template_string(PAGE, results=None, error='Use a valid UTF-8 CSV or TXT file.'), 400
     if not values or len(values) > 5000:
         return render_template_string(PAGE, results=None, error='File must contain 1 to 5,000 numbers.'), 400
     results = [check_number(value, region) for value in values]
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['input','valid','e164','region','carrier','type','note'])
-    for row in results:
-        writer.writerow([safe_cell(row[key]) for key in ('input','valid','e164','region','carrier','type','note')])
-    # No server-side result history: send export via browser form in a future authenticated version.
-    return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename="filter-my-numbers.csv"', 'Cache-Control': 'no-store'})
+    csvrows = [list(HEADERS)] + [[safe_cell(row[key]) for key in HEADERS] for row in results]
+    response = Response(render_template_string(PAGE, results=results, csvrows=csvrows, error=None))
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 @app.get('/health')
 def health():
-    return {'status':'ok'}
+    return {'status': 'ok'}
 
 @app.errorhandler(413)
 def too_large(error):
